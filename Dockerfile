@@ -1,59 +1,65 @@
+# --- Base image ---
 FROM docker.io/library/node:24-slim@sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4d7f0692e4d1fe5db0e AS dependencies
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
-RUN corepack prepare pnpm@11.1.1 --activate
+RUN corepack enable && corepack prepare pnpm@11.1.1 --activate
 WORKDIR /app
+
+# --- Install dependencies only for web app ---
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/readest-app/package.json ./apps/readest-app/
 COPY patches/ ./patches/
 COPY packages/ ./packages/
-RUN --mount=type=cache,id=pnpm,sharing=locked,target=/pnpm/store pnpm install --frozen-lockfile
-RUN test -f packages/foliate-js/vendor/pdfjs/annotation_layer_builder.css \
-    && test -d packages/simplecc-wasm/dist/web \
-    || { printf '\nERROR: Required git submodules are not initialized in the source directory.\nEnsure submodules are initialized before running docker build.\nRun: git submodule update --init packages/foliate-js packages/simplecc-wasm\n\n'; exit 1; }
-RUN pnpm --filter @readest/readest-app setup-vendors
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
-FROM docker.io/library/node:24-slim@sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4d7f0692e4d1fe5db0e AS development-stage
-ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
-RUN corepack prepare pnpm@11.1.1 --activate
-WORKDIR /app
-COPY --from=dependencies /app /app
-COPY . .
-WORKDIR /app/apps/readest-app
-EXPOSE 3000
-ENTRYPOINT ["pnpm", "dev-web", "-H", "0.0.0.0"]
 
-FROM docker.io/library/node:24-slim@sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4d7f0692e4d1fe5db0e AS build
-ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
-RUN corepack prepare pnpm@11.1.1 --activate
-WORKDIR /app
-ARG NEXT_PUBLIC_SUPABASE_URL
-ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
-ARG NEXT_PUBLIC_APP_PLATFORM
-ARG NEXT_PUBLIC_API_BASE_URL
-ARG NEXT_PUBLIC_OBJECT_STORAGE_TYPE
-ARG NEXT_PUBLIC_STORAGE_FIXED_QUOTA
-ARG NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA
-COPY --from=dependencies /app/node_modules /app/node_modules
-COPY --from=dependencies /app/apps/readest-app/node_modules /app/apps/readest-app/node_modules
-COPY --from=dependencies /app/apps/readest-app/public/vendor /app/apps/readest-app/public/vendor
-COPY --from=dependencies /app/packages/foliate-js/node_modules /app/packages/foliate-js/node_modules
-COPY . .
+# --- Copy source and build web app ---
+COPY apps/readest-app ./apps/readest-app
 WORKDIR /app/apps/readest-app
-RUN pnpm build-web
+COPY apps/readest-app/.env.web .env.web
+COPY apps/readest-app/.env.local.example .env.local.example
 
-FROM docker.io/library/node:24-slim@sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4d7f0692e4d1fe5db0e AS production-stage
-ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
-RUN corepack prepare pnpm@11.1.1 --activate
+# Prepare .env.local with placeholders for runtime injection
+RUN env_source=/app/apps/readest-app/.env.local.example; \
+	env_target=/app/apps/readest-app/.env.local; \
+	awk -F= '/^NEXT_PUBLIC_/ && $1 != "" { printf "%s=\\$%s\n", $1, $1 }' $env_source >> $env_target && \
+	# Replace placeholder to avoid build errors
+	sed -i 's|^NEXT_PUBLIC_SUPABASE_URL=.*$|NEXT_PUBLIC_SUPABASE_URL=https://your-supabase-url.com|' $env_target
+
+ENV CI="true"
+RUN pnpm install
+RUN pnpm --filter=@readest/readest-app setup-vendors && \
+	pnpm --filter=@readest/readest-app build-web
+
+# Replace placeholder in built JS files with runtime env variable
+RUN find /app/apps/readest-app/.next -name "*.js" -type f -exec sed -i "s|https://your-supabase-url.com|\$NEXT_PUBLIC_SUPABASE_URL|g" {} +
+
+RUN rm -rf /app/apps/readest-app/.next/cache && \
+	pnpm --filter=@readest/readest-app install dotenv-cli @next/bundle-analyzer -P
+
+# --- Production image ---
+FROM base AS production
+ENV NODE_ENV=production
 WORKDIR /app
-COPY --from=build /app /app
+
+COPY --from=base /app/apps/readest-app/package.json /app/apps/readest-app/package.json
+COPY --from=base /app/package.json /app/package.json
+COPY --from=base /app/pnpm-lock.yaml /app/pnpm-workspace.yaml ./
+COPY --from=base /app/apps/readest-app/.next /app/apps/readest-app/.next
+COPY --from=base /app/apps/readest-app/public /app/apps/readest-app/public
+
+ENV CI="true"
+RUN pnpm fetch --prod && pnpm install -r --offline --prod && \
+	# Install gettext for envsubst
+	apt-get update && apt-get install -y gettext-base && \
+	rm -rf /var/lib/apt/lists/*
+
+    # Add at the end to leverage cache
+COPY ./docker-entrypoint.sh /docker-entrypoint.sh
+
+RUN chmod +x /docker-entrypoint.sh && \
+	rm -rf packages/tauri* apps/readest-app/src-tauri
+
 WORKDIR /app/apps/readest-app
-ENTRYPOINT ["pnpm", "start-web", "-H", "0.0.0.0"]
+ENTRYPOINT ["/docker-entrypoint.sh"]
 EXPOSE 3000
