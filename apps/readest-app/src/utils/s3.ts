@@ -37,6 +37,8 @@ const s3SigningClient = new S3Client({
   region: S3_REGION,
   endpoint: S3_PUBLIC_ENDPOINT,
   credentials: s3ClientCredentials,
+  requestChecksumCalculation: "WHEN_REQUIRED", // https://git.deuxfleurs.fr/Deuxfleurs/garage/issues/1236
+  responseChecksumValidation: "WHEN_REQUIRED",
 });
 
 export const s3Storage = {
@@ -73,7 +75,9 @@ export const s3Storage = {
       Bucket: bucketName,
       Key: fileKey,
       ContentLength: contentLength,
-    })
+      // optional:  to ensure that no headers are enforced - see https://git.deuxfleurs.fr/Deuxfleurs/garage/issues/1236
+      ChecksumAlgorithm: undefined,
+    });
 
     const uploadUrl = await getSignedUrl(s3SigningClient, putCommand, {
       expiresIn: expiresIn,
