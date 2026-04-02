@@ -37,8 +37,8 @@ const s3SigningClient = new S3Client({
   region: S3_REGION,
   endpoint: S3_PUBLIC_ENDPOINT,
   credentials: s3ClientCredentials,
-  requestChecksumCalculation: "WHEN_REQUIRED", // https://git.deuxfleurs.fr/Deuxfleurs/garage/issues/1236
-  responseChecksumValidation: "WHEN_REQUIRED",
+  requestChecksumCalculation: 'WHEN_REQUIRED', // https://git.deuxfleurs.fr/Deuxfleurs/garage/issues/1236
+  responseChecksumValidation: 'WHEN_REQUIRED',
 });
 
 export const s3Storage = {
