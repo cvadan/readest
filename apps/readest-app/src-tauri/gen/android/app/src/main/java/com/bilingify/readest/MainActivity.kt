@@ -2,6 +2,7 @@ package com.bilingify.readest
 
 import android.os.Build
 import android.os.Bundle
+import android.view.ActionMode
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.webkit.WebView
@@ -22,6 +23,7 @@ import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import com.readest.native_bridge.KeyDownInterceptor
 import com.readest.native_bridge.NativeBridgePlugin
+import com.readest.native_bridge.SelectionMenuSuppressor
 
 class MainActivity : TauriActivity(), KeyDownInterceptor {
     private var wv: WebView? = null
@@ -29,9 +31,35 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
     private var interceptBackKeyEnabled = false
     private var interceptPageTurnerKeysEnabled = false
     private var keyLearnModeEnabled = false
+    // touchmove fires continuously; throttle its dispatch to ~10/s since each one
+    // is an evaluateJavascript round-trip into the WebView.
+    private val touchMoveThrottleMs = 100L
+    private var lastTouchMoveTime = 0L
+    // #3297: on Android 14+ the window can gain focus before the WebView has
+    // loaded/painted its first frame, leaving a blank screen. Force a single
+    // repaint as soon as both the window has focus and the WebView exists —
+    // whichever happens last — so the compositor draws the initial frame.
+    private var hasWindowFocus = false
+    private var didInitialInvalidate = false
 
     override fun onWebViewCreate(webView: WebView) {
         wv = webView
+        ensureInitialPaint()
+    }
+
+    private fun ensureInitialPaint() {
+        val webView = wv ?: return
+        if (didInitialInvalidate || !hasWindowFocus) return
+        didInitialInvalidate = true
+        webView.post { webView.invalidate() }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            hasWindowFocus = true
+            ensureInitialPaint()
+        }
     }
 
     private val keyEventMap = mapOf(
@@ -78,6 +106,20 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
         keyLearnModeEnabled = enabled
     }
 
+    // #5427: Chromium presents the system text-selection toolbar
+    // (Copy / Share / Select all) through paths that never fire a cancelable
+    // contextmenu event, so it can cover Readest's own annotation toolbar.
+    // While the JS side keeps the flag set (reader text is selected), hand
+    // the framework a no-op ActionMode so the floating toolbar is never
+    // built; selection and drag handles are unaffected.
+    override fun onWindowStartingActionMode(
+        callback: ActionMode.Callback?,
+        type: Int
+    ): ActionMode? {
+        return SelectionMenuSuppressor.onWindowStartingActionMode(window?.decorView, callback, type)
+            ?: super.onWindowStartingActionMode(callback, type)
+    }
+
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         val action = when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> "touchstart"
@@ -85,10 +127,19 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
             MotionEvent.ACTION_CANCEL -> "touchcancel"
             MotionEvent.ACTION_POINTER_DOWN -> "touchstart"
             MotionEvent.ACTION_POINTER_UP -> "touchend"
+            MotionEvent.ACTION_MOVE -> "touchmove"
             else -> null
         }
 
-        action?.let { eventType ->
+        // touchmove fires continuously; throttle its dispatch to ~10/s (each one
+        // is an evaluateJavascript round-trip). down/up/cancel always go through.
+        val throttledMove = action == "touchmove" &&
+            event.eventTime - lastTouchMoveTime < touchMoveThrottleMs
+        if (action == "touchmove" && !throttledMove) {
+            lastTouchMoveTime = event.eventTime
+        }
+
+        action?.takeIf { !throttledMove }?.let { eventType ->
             val pointerIndex = event.actionIndex
             val pointerId = event.getPointerId(pointerIndex)
             val x = event.getX(pointerIndex)

@@ -1,4 +1,5 @@
 import { SystemSettings } from './settings';
+import type { RssFeed } from '@/types/rss';
 import { Book, BookConfig, BookContent, ImportBookOptions, ViewSettings } from './book';
 import { BookMetadata } from '@/libs/document';
 import type { BookNav } from '@/services/nav';
@@ -15,7 +16,7 @@ export type AppPlatform = 'web' | 'tauri' | 'node';
 export type OsPlatform = 'android' | 'ios' | 'macos' | 'windows' | 'linux' | 'unknown';
 // biome-ignore format: keep the union members compact on a single line
 export type BaseDir = | 'Books' | 'Settings' | 'Data' | 'Fonts' | 'Images' | 'Dictionaries' | 'Log' | 'Cache' | 'Temp' | 'None';
-export type DeleteAction = 'cloud' | 'local' | 'both';
+export type DeleteAction = 'cloud' | 'local' | 'both' | 'purge';
 export type SelectDirectoryMode = 'read' | 'write';
 export type DistChannel = 'readest' | 'playstore' | 'appstore' | 'unknown';
 
@@ -41,7 +42,7 @@ export type FileInfo = {
 };
 
 export type NativeTouchEventType = {
-  type: 'touchstart' | 'touchcancel' | 'touchend';
+  type: 'touchstart' | 'touchmove' | 'touchcancel' | 'touchend';
   pointerId: number;
   x: number;
   y: number;
@@ -68,6 +69,16 @@ export interface FileSystem {
   getPrefix(base: BaseDir): Promise<string>;
 }
 
+export interface SaveLibraryBooksOptions {
+  /**
+   * Overwrite `library.json` with exactly the given set, allowing it to shrink.
+   * Reserved for deliberate, authoritative rewrites (tombstone GC, explicit
+   * "clear library", account reset). Routine saves must NOT set this — the
+   * default merge-floor protects against silently dropping books on disk.
+   */
+  replace?: boolean;
+}
+
 export interface AppService {
   osPlatform: OsPlatform;
   appPlatform: AppPlatform;
@@ -81,6 +92,8 @@ export interface AppService {
   hasUpdater: boolean;
   hasOrientationLock: boolean;
   hasScreenBrightness: boolean;
+  /** True when a hardware ambient light sensor can drive Ambient Mode. */
+  hasAmbientLightSensor: boolean;
   hasIAP: boolean;
   isMobile: boolean;
   isAppDataSandbox: boolean;
@@ -97,6 +110,8 @@ export interface AppService {
   canCustomizeRootDir: boolean;
   canReadExternalDir: boolean;
   supportsCanvasContext2DFilter: boolean;
+  supportsViewTransitionsAPI: boolean;
+  supportsViewTransitionGroup: boolean;
   distChannel: DistChannel;
   storefrontRegionCode: string | null;
   isOnlineCatalogsAccessible: boolean;
@@ -145,6 +160,9 @@ export interface AppService {
       sharePosition?: { x: number; y: number; preferredEdge?: 'top' | 'bottom' | 'left' | 'right' };
     },
   ): Promise<boolean>;
+  // Save an image into the system photo gallery (Android MediaStore). Returns
+  // false on platforms without a gallery (web/desktop) or on failure.
+  saveImageToGallery(filename: string, content: ArrayBuffer, mimeType: string): Promise<boolean>;
 
   getDefaultViewSettings(): ViewSettings;
   loadSettings(): Promise<SystemSettings>;
@@ -162,6 +180,7 @@ export interface AppService {
   refreshBookMetadata(book: Book): Promise<boolean>;
   deleteBook(book: Book, deleteAction: DeleteAction): Promise<void>;
   uploadBook(book: Book, onProgress?: ProgressHandler): Promise<void>;
+  uploadBookCover(book: Book, onProgress?: ProgressHandler): Promise<void>;
   downloadBook(
     book: Book,
     onlyCover?: boolean,
@@ -175,6 +194,7 @@ export interface AppService {
     handleProgress: ProgressHandler,
     hash: string,
     temp?: boolean,
+    media?: string,
   ): Promise<string | undefined>;
   uploadReplicaFile(
     kind: string,
@@ -203,12 +223,16 @@ export interface AppService {
   loadBookNav(book: Book): Promise<BookNav | null>;
   saveBookNav(book: Book, nav: BookNav): Promise<void>;
   loadBookContent(book: Book): Promise<BookContent>;
+  resolveNativeBookFilePath(book: Book): Promise<string | null>;
+  loadFeeds(): Promise<RssFeed[]>;
+  saveFeeds(feeds: RssFeed[]): Promise<void>;
   loadLibraryBooks(): Promise<Book[]>;
-  saveLibraryBooks(books: Book[]): Promise<void>;
+  saveLibraryBooks(books: Book[], options?: SaveLibraryBooksOptions): Promise<void>;
   getCoverImageUrl(book: Book): string;
   getCoverImageBlobUrl(book: Book): Promise<string>;
   generateCoverImageUrl(book: Book): Promise<string>;
   updateCoverImage(book: Book, imageUrl?: string, imageFile?: string): Promise<void>;
+  computeCoverHash(book: Book): Promise<string | null>;
   ask(message: string): Promise<boolean>;
   openDatabase(
     schema: SchemaType,
@@ -216,4 +240,6 @@ export interface AppService {
     base: BaseDir,
     opts?: DatabaseOpts,
   ): Promise<DatabaseService>;
+  databaseExists(path: string, base: BaseDir): Promise<boolean>;
+  deleteDatabase(path: string, base: BaseDir): Promise<void>;
 }

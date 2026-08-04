@@ -1,4 +1,5 @@
 import { SystemSettings } from '@/types/settings';
+import { applySyncBooksAutoEnable } from '@/services/sync/cloudSyncProvider';
 import {
   AppPlatform,
   AppService,
@@ -9,6 +10,7 @@ import {
   FileSystem,
   OsPlatform,
   ResolvedPath,
+  SaveLibraryBooksOptions,
   SelectDirectoryMode,
 } from '@/types/system';
 import { DatabaseOpts, DatabaseService } from '@/types/database';
@@ -18,6 +20,7 @@ import type { BookNav } from '@/services/nav';
 import { getLibraryFilename, getLibraryBackupFilename } from '@/utils/book';
 
 import { getOSPlatform } from '@/utils/misc';
+import { isStoragePermissionError, requestStoragePermission } from '@/utils/permission';
 import { ProgressHandler } from '@/utils/transfer';
 import { CustomTextureInfo } from '@/styles/textures';
 import { CustomFont, CustomFontInfo } from '@/styles/fonts';
@@ -31,6 +34,11 @@ import * as FontSvc from './fontService';
 import * as ImageSvc from './imageService';
 import * as LibrarySvc from './libraryService';
 import * as Settings from './settingsService';
+import {
+  loadFeeds as loadFeedsFromDisk,
+  saveFeeds as saveFeedsToDisk,
+} from '@/services/rss/feedPersistence';
+import type { RssFeed } from '@/types/rss';
 
 export abstract class BaseAppService implements AppService {
   osPlatform: OsPlatform = getOSPlatform();
@@ -58,15 +66,18 @@ export abstract class BaseAppService implements AppService {
   hasUpdater = false;
   hasOrientationLock = false;
   hasScreenBrightness = false;
+  hasAmbientLightSensor = false;
   hasIAP = false;
   canCustomizeRootDir = false;
   canReadExternalDir = false;
   supportsCanvasContext2DFilter = true;
+  supportsViewTransitionsAPI = false;
+  supportsViewTransitionGroup = false;
   distChannel = 'readest' as DistChannel;
   storefrontRegionCode: string | null = null;
   isOnlineCatalogsAccessible = true;
 
-  protected CURRENT_MIGRATION_VERSION = 20251124;
+  protected CURRENT_MIGRATION_VERSION = 20260706;
 
   protected abstract fs: FileSystem;
   protected abstract resolvePath(fp: string, base: BaseDir): ResolvedPath;
@@ -85,6 +96,11 @@ export abstract class BaseAppService implements AppService {
       sharePosition?: { x: number; y: number; preferredEdge?: 'top' | 'bottom' | 'left' | 'right' };
     },
   ): Promise<boolean>;
+  abstract saveImageToGallery(
+    filename: string,
+    content: ArrayBuffer,
+    mimeType: string,
+  ): Promise<boolean>;
   abstract ask(message: string): Promise<boolean>;
   abstract openDatabase(
     schema: SchemaType,
@@ -93,13 +109,50 @@ export abstract class BaseAppService implements AppService {
     opts?: DatabaseOpts,
   ): Promise<DatabaseService>;
 
-  protected async runMigrations(lastMigrationVersion: number): Promise<void> {
+  // Databases live at the resolved fs path on native and node; the web app
+  // overrides both because its databases live in OPFS under flattened names,
+  // invisible to the IndexedDB-backed fs layer.
+  async databaseExists(path: string, base: BaseDir): Promise<boolean> {
+    return this.fs.exists(path, base);
+  }
+
+  async deleteDatabase(path: string, base: BaseDir): Promise<void> {
+    await this.fs.removeFile(path, base).catch(() => {});
+    await this.fs.removeFile(`${path}-wal`, base).catch(() => {});
+  }
+
+  protected async runMigrations(
+    lastMigrationVersion: number,
+    settings?: SystemSettings,
+  ): Promise<void> {
     if (lastMigrationVersion < 20251124) {
       try {
         await this.migrate20251124();
       } catch (error) {
         console.error('Error migrating to version 20251124:', error);
       }
+    }
+    if (lastMigrationVersion < 20260706 && settings) {
+      try {
+        this.migrate20260706(settings);
+      } catch (error) {
+        console.error('Error migrating to version 20260706:', error);
+      }
+    }
+  }
+
+  /**
+   * Users with WebDAV/Drive already enabled had native Readest Cloud uploads
+   * gated off when cloud sync provider selection shipped; flip syncBooks on
+   * once for every enabled third-party backend so their books keep backing up
+   * somewhere. This force-enables syncBooks a single time even for a user who
+   * had explicitly turned it off — intentional, since the alternative is books
+   * backing up nowhere. Mutates the caller's settings snapshot, which the
+   * caller persists together with migrationVersion.
+   */
+  private migrate20260706(settings: SystemSettings): void {
+    if (applySyncBooksAutoEnable(settings)) {
+      console.log('Migration 20260706: enabled syncBooks for enabled cloud sync backends.');
     }
   }
 
@@ -158,7 +211,13 @@ export abstract class BaseAppService implements AppService {
 
   async resolveFilePath(path: string, base: BaseDir): Promise<string> {
     const prefix = await this.fs.getPrefix(base);
-    return path ? `${prefix}/${path}` : prefix;
+    if (!path) return prefix;
+    // `base: 'None'` carries an already-absolute source path (in-place /
+    // external books point `book.filePath` outside Books/<hash>/) and its
+    // prefix is empty. Joining unconditionally turned `C:\Users\…` into
+    // `/C:\Users\…` (and `/Users/…` into `//Users/…`), which the native
+    // upload guard rejects as outside the fs scope — issue #4720.
+    return prefix ? `${prefix}/${path}` : path;
   }
 
   async readDirectory(path: string, base: BaseDir): Promise<FileItem[]> {
@@ -226,6 +285,10 @@ export abstract class BaseAppService implements AppService {
     return BookSvc.updateCoverImage(this.coverCtx, book, imageUrl, imageFile);
   }
 
+  async computeCoverHash(book: Book): Promise<string | null> {
+    return BookSvc.computeCoverHash(this.fs, book);
+  }
+
   async importFont(file?: string | File): Promise<CustomFontInfo | null> {
     return FontSvc.importFont(this.fs, file);
   }
@@ -261,6 +324,10 @@ export abstract class BaseAppService implements AppService {
     return BookSvc.importBook(this.fs, file, books, {
       saveBookConfig: this.saveBookConfig.bind(this),
       generateCoverImageUrl: this.generateCoverImageUrl.bind(this),
+      // Pass the host platform through so the in-place fast path and the
+      // lookup index can normalize source paths consistently on
+      // case-insensitive filesystems (macOS / iOS / Windows).
+      osPlatform: this.osPlatform,
       ...options,
     });
   }
@@ -276,6 +343,7 @@ export abstract class BaseAppService implements AppService {
     handleProgress: ProgressHandler,
     hash: string,
     temp: boolean = false,
+    media?: string,
   ) {
     return CloudSvc.uploadFileToCloud(
       this.fs,
@@ -286,6 +354,7 @@ export abstract class BaseAppService implements AppService {
       handleProgress,
       hash,
       temp,
+      media,
     );
   }
 
@@ -336,6 +405,10 @@ export abstract class BaseAppService implements AppService {
 
   async uploadBook(book: Book, onProgress?: ProgressHandler): Promise<void> {
     return CloudSvc.uploadBook(this.fs, this.resolveFilePath.bind(this), book, onProgress);
+  }
+
+  async uploadBookCover(book: Book, onProgress?: ProgressHandler): Promise<void> {
+    return CloudSvc.uploadBookCover(this.fs, this.resolveFilePath.bind(this), book, onProgress);
   }
 
   async downloadCloudFile(lfp: string, cfp: string, onProgress: ProgressHandler) {
@@ -389,6 +462,10 @@ export abstract class BaseAppService implements AppService {
     return BookSvc.loadBookContent(this.fs, book);
   }
 
+  async resolveNativeBookFilePath(book: Book): Promise<string | null> {
+    return BookSvc.resolveNativeBookFilePath(this.fs, this.resolveFilePath.bind(this), book);
+  }
+
   async loadBookConfig(book: Book, settings: SystemSettings): Promise<BookConfig> {
     return BookSvc.loadBookConfig(this.fs, book, settings);
   }
@@ -409,11 +486,43 @@ export abstract class BaseAppService implements AppService {
     return BookSvc.saveBookNav(this.fs, book, nav);
   }
 
+  async loadFeeds(): Promise<RssFeed[]> {
+    return loadFeedsFromDisk(this.fs);
+  }
+
+  async saveFeeds(feeds: RssFeed[]): Promise<void> {
+    return saveFeedsToDisk(this.fs, feeds);
+  }
+
   async loadLibraryBooks(): Promise<Book[]> {
     return LibrarySvc.loadLibraryBooks(this.fs, this.generateCoverImageUrl.bind(this));
   }
 
-  async saveLibraryBooks(books: Book[]): Promise<void> {
-    return LibrarySvc.saveLibraryBooks(this.fs, books);
+  // Prompt for storage permission at most once per session (see saveLibraryBooks).
+  private storagePermissionRequested = false;
+
+  async saveLibraryBooks(books: Book[], options?: SaveLibraryBooksOptions): Promise<void> {
+    try {
+      return await LibrarySvc.saveLibraryBooks(this.fs, books, options);
+    } catch (error) {
+      // A custom library folder on Android shared storage needs All Files
+      // Access. Without it the write fails with EACCES and, because callers
+      // (sync, imports) don't await/catch this, it surfaced as an unhandled
+      // rejection crash (Sentry READEST-A). Re-request the permission through
+      // the same flow used at import time and retry once. Only prompt once per
+      // session so background saves don't repeatedly yank the user to system
+      // settings; after that a still-denied save is logged, not crashed —
+      // the user was already shown the All Files Access screen.
+      if (!this.isAndroidApp || !isStoragePermissionError(error)) {
+        throw error;
+      }
+      if (!this.storagePermissionRequested) {
+        this.storagePermissionRequested = true;
+        if (await requestStoragePermission()) {
+          return await LibrarySvc.saveLibraryBooks(this.fs, books, options);
+        }
+      }
+      console.warn('[library] not saved: storage permission not granted', error);
+    }
   }
 }

@@ -9,7 +9,7 @@ vi.mock('@/utils/md5', () => ({
 }));
 
 import { useLibraryStore } from '@/store/libraryStore';
-import type { Book, BooksGroup } from '@/types/book';
+import type { Book } from '@/types/book';
 import type { EnvConfigType } from '@/services/environment';
 import type { AppService } from '@/types/system';
 
@@ -162,6 +162,25 @@ describe('libraryStore', () => {
 
       const visible = useLibraryStore.getState().getVisibleLibrary();
       expect(visible.map((b) => b.hash)).toEqual(['a', 'c']);
+    });
+
+    test('stamps readingStatusUpdatedAt when the status changes', () => {
+      useLibraryStore.getState().setLibrary([makeBook({ hash: 'a', readingStatus: undefined })]);
+      useLibraryStore.getState().updateBookProgress('a', [100, 100], 'finished');
+      const book = useLibraryStore.getState().getBookByHash('a');
+      expect(book?.readingStatus).toBe('finished');
+      expect(book?.readingStatusUpdatedAt).toBeGreaterThan(0);
+    });
+
+    test('does NOT change readingStatusUpdatedAt on a progress-only update', () => {
+      useLibraryStore
+        .getState()
+        .setLibrary([
+          makeBook({ hash: 'a', readingStatus: 'reading', readingStatusUpdatedAt: 111 }),
+        ]);
+      useLibraryStore.getState().updateBookProgress('a', [50, 100], 'reading');
+      const book = useLibraryStore.getState().getBookByHash('a');
+      expect(book?.readingStatusUpdatedAt).toBe(111);
     });
   });
 
@@ -489,20 +508,6 @@ describe('libraryStore', () => {
     test('sets the current bookshelf with books', () => {
       const books: Book[] = [makeBook({ hash: 'a' }), makeBook({ hash: 'b' })];
       useLibraryStore.getState().setCurrentBookshelf(books);
-
-      expect(useLibraryStore.getState().currentBookshelf).toHaveLength(2);
-    });
-
-    test('sets the current bookshelf with mixed books and groups', () => {
-      const book = makeBook({ hash: 'a' });
-      const group: BooksGroup = {
-        id: 'g1',
-        name: 'Fiction',
-        displayName: 'Fiction',
-        books: [],
-        updatedAt: 1000,
-      };
-      useLibraryStore.getState().setCurrentBookshelf([book, group]);
 
       expect(useLibraryStore.getState().currentBookshelf).toHaveLength(2);
     });

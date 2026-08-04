@@ -7,7 +7,14 @@
  * order; each provider writes lookup output into a per-tab container.
  */
 
-export type DictionaryProviderKind = 'builtin' | 'stardict' | 'mdict' | 'dict' | 'slob' | 'web';
+export type DictionaryProviderKind =
+  | 'builtin'
+  | 'stardict'
+  | 'mdict'
+  | 'dict'
+  | 'slob'
+  | 'bgl'
+  | 'web';
 
 export interface DictionaryLookupContext {
   /** Source language hint, e.g. book primary language code (`en`, `zh`). */
@@ -58,8 +65,8 @@ export interface DictionaryProvider {
  */
 export interface ImportedDictionary {
   id: string;
-  kind: 'stardict' | 'mdict' | 'dict' | 'slob';
-  /** Display name, derived from `.ifo` `bookname`, `.mdx` `Title`, slob `label`, or DICT `00databaseshort`. */
+  kind: 'stardict' | 'mdict' | 'dict' | 'slob' | 'bgl';
+  /** Display name, derived from `.ifo` `bookname`, `.mdx` `Title`, slob `label`, BGL title, or DICT `00databaseshort`. */
   name: string;
   /**
    * Stable cross-device content-hash id derived from
@@ -113,6 +120,8 @@ export interface ImportedDictionary {
     index?: string;
     // Slob bundle: a single self-contained `.slob` file.
     slob?: string;
+    // Babylon bundle: a single self-contained `.bgl` file.
+    bgl?: string;
   };
   /** Source language code if known. */
   lang?: string;
@@ -170,6 +179,14 @@ export interface DictionarySettings {
    * Merriam-Webster) are hardcoded in the registry and not stored here.
    */
   webSearches?: WebSearchEntry[];
+  /**
+   * Font-size multiplier for the dictionary popup content (independent of the
+   * main reading view, #4443). `1` = the default sizes; larger values scale
+   * every provider's rendered definition up. Drives the `--dict-font-scale`
+   * CSS variable on the popup content root, which feeds the light-DOM
+   * `font-size` rules and the MDict shadow `::part(dict-content)` rule alike.
+   */
+  fontScale?: number;
 }
 
 /** Stable ids for the built-in providers. */
@@ -201,6 +218,7 @@ export const BUILTIN_WEB_SEARCH_IDS = {
   google: 'web:builtin:google',
   urban: 'web:builtin:urban',
   merriamWebster: 'web:builtin:merriam-webster',
+  goodreads: 'web:builtin:goodreads',
 } as const;
 
 export type BuiltinWebSearchId =

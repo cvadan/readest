@@ -23,7 +23,11 @@ import { Overlay } from '@/components/Overlay';
 import { saveSysSettings } from '@/helpers/settings';
 import { NOTE_PREFIX } from '@/types/view';
 import useShortcuts from '@/hooks/useShortcuts';
-import BooknoteItem from '../sidebar/BooknoteItem';
+import {
+  findAnnotationAtCfi,
+  removeBookNoteOverlays,
+  removeEmptyAnnotationPlaceholder,
+} from '../../utils/annotatorUtil';
 import AIAssistant from './AIAssistant';
 import NotebookHeader from './Header';
 import NoteEditor from './NoteEditor';
@@ -44,11 +48,11 @@ const Notebook: React.FC = ({}) => {
     useNotebookStore();
   const { notebookNewAnnotation, notebookEditAnnotation, setNotebookPin } = useNotebookStore();
   const { getBookData, getConfig, saveConfig, updateBooknotes } = useBookDataStore();
-  const { getView, getProgress, getViewSettings } = useReaderStore();
+  const { getView, getViewsById, getProgress, getViewSettings } = useReaderStore();
   const { getNotebookWidth, setNotebookWidth, setNotebookVisible, toggleNotebookPin } =
     useNotebookStore();
-  const { setNotebookNewAnnotation, setNotebookEditAnnotation, setNotebookActiveTab } =
-    useNotebookStore();
+  const { setNotebookNewAnnotation, setNotebookNewHighlightId } = useNotebookStore();
+  const { setNotebookEditAnnotation, setNotebookActiveTab } = useNotebookStore();
   const { activeConversationId } = useAIChatStore();
 
   const [isSearchBarVisible, setIsSearchBarVisible] = useState(false);
@@ -139,6 +143,59 @@ const Notebook: React.FC = ({}) => {
     saveSysSettings(envConfig, 'globalReadSettings', newGlobalReadSettings);
   };
 
+  // Abandon a note-creation flow: tear down the empty highlight the "Annotate"
+  // action eagerly created as the note anchor so it doesn't leak into the
+  // booknotes list (#4791). A saved note carries text, so it survives the guard
+  // in removeEmptyAnnotationPlaceholder; a restyled pre-existing highlight has no
+  // tracked id and is left alone. `bookKey` is passed explicitly so the unmount/
+  // book-switch cleanup targets the book the placeholder belongs to.
+  const handleCancelNewAnnotation = useCallback(
+    (bookKey: string | null) => {
+      const { notebookNewHighlightId } = useNotebookStore.getState();
+      if (bookKey && notebookNewHighlightId) {
+        const config = getConfig(bookKey);
+        const { booknotes: annotations = [] } = config || {};
+        const placeholder = removeEmptyAnnotationPlaceholder(
+          annotations,
+          notebookNewHighlightId,
+          Date.now(),
+        );
+        if (placeholder) {
+          const views = getViewsById(bookKey.split('-')[0]!);
+          views.forEach((view) => removeBookNoteOverlays(view, placeholder));
+          const updatedConfig = updateBooknotes(bookKey, annotations);
+          if (updatedConfig) {
+            // Read settings fresh: this callback has stable identity (empty deps)
+            // so a captured `settings` would go stale across saves.
+            saveConfig(envConfig, bookKey, updatedConfig, useSettingsStore.getState().settings);
+          }
+        }
+      }
+      setNotebookNewHighlightId(null);
+      setNotebookNewAnnotation(null);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // The "Annotate" action keeps a placeholder highlight alive only while its
+  // editor is on screen. The moment that creation flow stops being presented —
+  // Cancel/Escape (selection cleared), the notebook closing, swipe-dismiss, or a
+  // navigate — clean the placeholder up (#4791). Save clears the tracked id (and
+  // the placeholder gains note text), so this no-ops for saved annotations.
+  useEffect(() => {
+    if (!(isNotebookVisible && notebookNewAnnotation)) {
+      handleCancelNewAnnotation(sideBarBookKey);
+    }
+  }, [isNotebookVisible, notebookNewAnnotation, sideBarBookKey, handleCancelNewAnnotation]);
+
+  // Switching books (notebook pinned, so it stays presented) or closing the
+  // reader leaves the placeholder behind; clean it up against the book we are
+  // leaving on the way out (#4791).
+  useEffect(() => {
+    return () => handleCancelNewAnnotation(sideBarBookKey);
+  }, [sideBarBookKey, handleCancelNewAnnotation]);
+
   const handleClickOverlay = () => {
     setNotebookVisible(false);
     setNotebookNewAnnotation(null);
@@ -154,23 +211,50 @@ const Notebook: React.FC = ({}) => {
     if (!cfi) return;
 
     const { booknotes: annotations = [] } = config;
-    const annotation: BookNote = {
-      id: uniqueId(),
-      type: 'annotation',
-      cfi,
-      note,
-      page: selection.page,
-      text: selection.text,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    view?.addAnnotation({ ...annotation, value: `${NOTE_PREFIX}${annotation.cfi}` });
-    annotations.push(annotation);
+    const existingIndex = findAnnotationAtCfi(annotations, cfi);
+    if (existingIndex !== -1) {
+      // Attach the note to the existing highlight at this CFI instead of
+      // creating a second record. The highlight overlay (value = cfi) already
+      // exists; add the note bubble overlay (value = NOTE_PREFIX+cfi).
+      const existing = annotations[existingIndex]!;
+      const updated: BookNote = {
+        ...existing,
+        note,
+        text: selection.text || existing.text,
+        updatedAt: Date.now(),
+      };
+      annotations[existingIndex] = updated;
+      view?.addAnnotation({ ...updated, value: `${NOTE_PREFIX}${updated.cfi}` });
+    } else {
+      // No highlight at this CFI yet (e.g. a note added without first
+      // highlighting): create one unified record with the current global style
+      // so the note still shows an underlying highlight, and draw both overlays.
+      const style = settings.globalReadSettings.highlightStyle;
+      const color = settings.globalReadSettings.highlightStyles[style];
+      const annotation: BookNote = {
+        id: uniqueId(),
+        type: 'annotation',
+        cfi,
+        style,
+        color,
+        note,
+        page: selection.page,
+        text: selection.text,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      view?.addAnnotation(annotation);
+      view?.addAnnotation({ ...annotation, value: `${NOTE_PREFIX}${annotation.cfi}` });
+      annotations.push(annotation);
+    }
     const updatedConfig = updateBooknotes(sideBarBookKey, annotations);
     if (updatedConfig) {
       saveConfig(envConfig, sideBarBookKey, updatedConfig, settings);
     }
     setNotebookNewAnnotation(null);
+    // The placeholder now carries a note (or a fresh unified record was created),
+    // so it's a real annotation — drop the cancel-cleanup handle (#4791).
+    setNotebookNewHighlightId(null);
   };
 
   const handleEditNote = (note: BookNote, isDelete: boolean) => {
@@ -207,9 +291,6 @@ const Notebook: React.FC = ({}) => {
 
   const config = getConfig(sideBarBookKey);
   const { booknotes: allNotes = [] } = config || {};
-  const annotationNotes = allNotes
-    .filter((note) => note.type === 'annotation' && note.note && !note.deletedAt)
-    .sort((a, b) => b.createdAt - a.createdAt);
   const excerptNotes = allNotes
     .filter((note) => note.type === 'excerpt' && note.text && !note.deletedAt)
     .sort((a, b) => a.createdAt - b.createdAt);
@@ -221,14 +302,6 @@ const Notebook: React.FC = ({}) => {
       setSearchTerm('');
     }
   };
-
-  const filteredAnnotationNotes = useMemo(
-    () =>
-      isSearchBarVisible && searchResults
-        ? searchResults.filter((note) => note.type === 'annotation' && note.note && !note.deletedAt)
-        : annotationNotes,
-    [annotationNotes, searchResults, isSearchBarVisible],
-  );
 
   const filteredExcerptNotes = useMemo(
     () =>
@@ -248,8 +321,8 @@ const Notebook: React.FC = ({}) => {
   const { bookDoc } = bookData;
   const languageDir = getBookDirFromLanguage(bookDoc.metadata.language);
 
-  const hasSearchResults = filteredAnnotationNotes.length > 0 || filteredExcerptNotes.length > 0;
-  const hasAnyNotes = annotationNotes.length > 0 || excerptNotes.length > 0;
+  const hasSearchResults = filteredExcerptNotes.length > 0;
+  const hasAnyNotes = excerptNotes.length > 0;
   const isNotesTabEmpty =
     !notebookNewAnnotation && !notebookEditAnnotation && !isSearchBarVisible && !hasAnyNotes;
 
@@ -426,25 +499,13 @@ const Notebook: React.FC = ({}) => {
               ))}
             </ul>
             <div dir='ltr'>
-              {(notebookNewAnnotation || filteredAnnotationNotes.length > 0) && (
-                <p className='content font-size-base'>
-                  {_('Notes')}
-                  {isSearchBarVisible && searchResults && filteredAnnotationNotes.length > 0 && (
-                    <span className='font-size-xs ml-2 text-gray-500'>
-                      ({filteredAnnotationNotes.length})
-                    </span>
-                  )}
-                </p>
+              {(notebookNewAnnotation || notebookEditAnnotation) && !isSearchBarVisible && (
+                <p className='content font-size-base'>{_('Notes')}</p>
               )}
             </div>
             {(notebookNewAnnotation || notebookEditAnnotation) && !isSearchBarVisible && (
               <NoteEditor onSave={handleSaveNote} onEdit={(item) => handleEditNote(item, false)} />
             )}
-            <ul>
-              {filteredAnnotationNotes.map((item, index) => (
-                <BooknoteItem key={`${index}-${item.cfi}`} bookKey={sideBarBookKey} item={item} />
-              ))}
-            </ul>
           </div>
         )}
         <div

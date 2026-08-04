@@ -1,17 +1,17 @@
 import clsx from 'clsx';
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useEnv } from '@/context/EnvContext';
-import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
-import { useAppRouter } from '@/hooks/useAppRouter';
 import { useLongPress } from '@/hooks/useLongPress';
-import { Menu, type MenuItemOptions } from '@tauri-apps/api/menu';
+import { Menu } from '@tauri-apps/api/menu';
+import { LogicalPosition } from '@tauri-apps/api/dpi';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { eventDispatcher } from '@/utils/event';
+import { openExternalUrl } from '@/utils/open';
+import { getBookGoodreadsQuery, getGoodreadsSearchUrl } from '@/utils/goodreads';
 import { getOSPlatform } from '@/utils/misc';
 import { throttle } from '@/utils/throttle';
-import { navigateToReader, showReaderWindow } from '@/utils/nav';
 import { LibraryCoverFitType, LibraryViewModeType } from '@/types/settings';
 import { BOOK_UNGROUPED_ID, BOOK_UNGROUPED_NAME } from '@/services/constants';
 import { FILE_REVEAL_LABELS, FILE_REVEAL_PLATFORMS } from '@/utils/os';
@@ -23,6 +23,8 @@ import {
 import { md5Fingerprint } from '@/utils/md5';
 import BookItem from './BookItem';
 import GroupItem from './GroupItem';
+import BookContextMenuPopup, { type BookContextMenuItem } from './BookContextMenuPopup';
+import { useOpenBook } from '../hooks/useOpenBook';
 
 export const generateBookshelfItems = (
   books: Book[],
@@ -105,6 +107,7 @@ interface BookshelfItemProps {
   handleShowDetailsBook: (book: Book) => void;
   handleLibraryNavigation: (targetGroup: string) => void;
   handleUpdateReadingStatus: (book: Book, status: ReadingStatus | undefined) => void;
+  showTimeRemaining: boolean;
 }
 
 const BookshelfItem: React.FC<BookshelfItemProps> = ({
@@ -123,41 +126,17 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
   handleShowDetailsBook,
   handleLibraryNavigation,
   handleUpdateReadingStatus,
+  showTimeRemaining,
 }) => {
   const _ = useTranslation();
-  const router = useAppRouter();
-  const { envConfig, appService } = useEnv();
+  const { appService } = useEnv();
   const { settings } = useSettingsStore();
-  const { updateBook } = useLibraryStore();
+  const { openBook } = useOpenBook({ setLoading, handleBookDownload });
 
   const showBookDetailsModal = useCallback(async (book: Book) => {
     handleShowDetailsBook(book);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const makeBookAvailable = async (book: Book) => {
-    if (book.uploadedAt && !book.downloadedAt) {
-      if (await appService?.isBookAvailable(book)) {
-        if (!book.downloadedAt || !book.coverDownloadedAt) {
-          book.downloadedAt = Date.now();
-          book.coverDownloadedAt = Date.now();
-          await updateBook(envConfig, book);
-        }
-        return true;
-      }
-      let available = false;
-      const loadingTimeout = setTimeout(() => setLoading(true), 200);
-      try {
-        available = await handleBookDownload(book, { queued: false });
-        await updateBook(envConfig, book);
-      } finally {
-        if (loadingTimeout) clearTimeout(loadingTimeout);
-        setLoading(false);
-      }
-      return available;
-    }
-    return true;
-  };
 
   const handleBookClick = useCallback(
     async (book: Book) => {
@@ -165,40 +144,9 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
         toggleSelection(book.hash);
         return;
       }
-      // In-place books point at a file outside Books/<hash>/ that the user
-      // (or another app) may have moved, renamed, or deleted between sessions.
-      // Probe the source before navigating: if it's gone, drop the stale
-      // library record instead of opening the reader only to fail inside
-      // loadBookContent and bounce back with a toast. We restrict this to
-      // purely-local in-place books — cloud-synced books (`uploadedAt`) still
-      // go through `makeBookAvailable`'s on-demand download path below, and
-      // hash-copy books (no `filePath`) shouldn't lose their Books/<hash>/
-      // file under normal use, so we don't second-guess those here.
-      if (book.filePath && !book.uploadedAt && !book.deletedAt) {
-        const available = await appService?.isBookAvailable(book);
-        if (!available) {
-          eventDispatcher.dispatch('toast', {
-            message: _(
-              'Book file no longer exists. Confirm deletion to remove it from the library.',
-            ),
-            type: 'info',
-          });
-          eventDispatcher.dispatch('delete-books', { ids: [book.hash] });
-          return;
-        }
-      }
-      const available = await makeBookAvailable(book);
-      if (!available) return;
-      if (appService?.hasWindow && settings.openBookInNewWindow) {
-        showReaderWindow(appService, [book.hash]);
-      } else {
-        setTimeout(() => {
-          navigateToReader(router, [book.hash]);
-        }, 0);
-      }
+      await openBook(book);
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isSelectMode, settings.openBookInNewWindow, appService],
+    [isSelectMode, openBook, toggleSelection],
   );
 
   const handleGroupClick = useCallback(
@@ -213,8 +161,7 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
     [isSelectMode, handleLibraryNavigation],
   );
 
-  const bookContextMenuHandler = async (book: Book) => {
-    if (!appService?.hasContextMenu) return;
+  const buildBookMenuItems = (book: Book): BookContextMenuItem[] => {
     const osPlatform = getOSPlatform();
     const fileRevealLabel =
       FILE_REVEAL_LABELS[osPlatform as FILE_REVEAL_PLATFORMS] || FILE_REVEAL_LABELS.default;
@@ -222,7 +169,7 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
     // in a single Menu.new({ items }) call. Appending items one-by-one with
     // un-awaited Menu.append() promises races on the Tauri IPC boundary and
     // shuffles the order on every open (issue #4389).
-    const itemOptions: Record<BookContextMenuItemId, MenuItemOptions> = {
+    const itemOptions: Record<BookContextMenuItemId, BookContextMenuItem> = {
       select: {
         text: itemSelected ? _('Deselect Book') : _('Select Book'),
         action: async () => {
@@ -252,6 +199,12 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
           handleUpdateReadingStatus(book, 'unread');
         },
       },
+      markAbandoned: {
+        text: _('Mark as On hold'),
+        action: async () => {
+          handleUpdateReadingStatus(book, 'abandoned');
+        },
+      },
       clearStatus: {
         text: _('Clear Status'),
         action: async () => {
@@ -269,6 +222,12 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
         action: async () => {
           const folder = `${settings.localBooksDir}/${book.hash}`;
           revealItemInDir(folder);
+        },
+      },
+      searchGoodreads: {
+        text: _('Search on Goodreads'),
+        action: async () => {
+          openExternalUrl(getGoodreadsSearchUrl(getBookGoodreadsQuery(book)));
         },
       },
       download: {
@@ -298,16 +257,13 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
         },
       },
     };
-    const items = getBookContextMenuItemIds(book).map((id) => itemOptions[id]);
-    const menu = await Menu.new({ items });
-    await menu.popup();
+    return getBookContextMenuItemIds(book).map((id) => itemOptions[id]);
   };
 
-  const groupContextMenuHandler = async (group: BooksGroup) => {
-    if (!appService?.hasContextMenu) return;
+  const buildGroupMenuItems = (group: BooksGroup): BookContextMenuItem[] => {
     // Single Menu.new({ items }) call keeps the order deterministic — see the
     // note in bookContextMenuHandler about the Menu.append() IPC race (#4389).
-    const items: MenuItemOptions[] = [
+    return [
       {
         text: itemSelected ? _('Deselect Group') : _('Select Group'),
         action: async () => {
@@ -337,9 +293,46 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
         },
       },
     ];
-    const menu = await Menu.new({ items });
-    await menu.popup();
   };
+
+  const buildMenuItems = () =>
+    'format' in item ? buildBookMenuItems(item as Book) : buildGroupMenuItems(item as BooksGroup);
+
+  // In-app fallback for the native context menu: GTK3 menus popped over
+  // Wayland after the trigger button was already released (a touchpad
+  // two-finger tap) are dismissed as soon as they map, flashing for a single
+  // frame (issue #5360). The popup path (JS → Tauri IPC → muda → GTK) cannot
+  // beat a tap's instant release, so Linux renders the menu in-app instead.
+  const [inAppMenuPosition, setInAppMenuPosition] = useState<{ x: number; y: number } | null>(null);
+
+  // Building the menu crosses the Tauri IPC boundary and takes long enough
+  // that the popup visibly lags the right-click (issue #5181). Cache the
+  // built menu so popup() fires immediately; hovering the item prewarms the
+  // cache so even the first opening is instant.
+  const cachedMenuRef = useRef<Promise<Menu> | null>(null);
+
+  const ensureMenu = () => {
+    if (!cachedMenuRef.current) {
+      const building = Menu.new({ items: buildMenuItems() });
+      building.catch(() => {
+        // A failed build must not poison the cache with a rejected promise.
+        if (cachedMenuRef.current === building) cachedMenuRef.current = null;
+      });
+      cachedMenuRef.current = building;
+    }
+    return cachedMenuRef.current;
+  };
+
+  // Drop the cache whenever state baked into the items changes (selection
+  // label, book status, reveal path, language); the cleanup also runs on
+  // unmount so the native menu resource is released.
+  useEffect(() => {
+    return () => {
+      const cached = cachedMenuRef.current;
+      cachedMenuRef.current = null;
+      cached?.then((menu) => menu.close()).catch(() => {});
+    };
+  }, [item, itemSelected, isSelectMode, settings.localBooksDir, _]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleSelectItem = useCallback(
@@ -374,14 +367,21 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleContextMenu = useCallback(
-    throttle(() => {
-      if ('format' in item) {
-        bookContextMenuHandler(item as Book);
-      } else {
-        groupContextMenuHandler(item as BooksGroup);
+    throttle(async (position: { x: number; y: number }) => {
+      if (!appService?.hasContextMenu) return;
+      if (appService.isLinuxApp) {
+        setInAppMenuPosition(position);
+        return;
       }
+      const menu = await ensureMenu();
+      // Pop up at an explicit position so keyboard invocation (ContextMenu /
+      // Shift+F10) anchors the menu to the item instead of wherever the mouse
+      // happens to sit. On macOS and Windows — the only platforms still on the
+      // native menu — CSS px are window-logical px, so the client coordinates
+      // pass through unchanged.
+      await menu.popup(new LogicalPosition(position.x, position.y));
     }, 100),
-    [itemSelected, settings.localBooksDir],
+    [item, itemSelected, isSelectMode, settings.localBooksDir],
   );
 
   const { pressing, handlers } = useLongPress(
@@ -392,9 +392,9 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
       onTap: () => {
         handleOpenItem();
       },
-      onContextMenu: () => {
+      onContextMenu: (e) => {
         if (appService?.hasContextMenu) {
-          handleContextMenu();
+          handleContextMenu({ x: e.clientX, y: e.clientY });
         } else if (appService?.isAndroidApp) {
           handleSelectItem();
         }
@@ -410,7 +410,8 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
     }
     if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
       e.preventDefault();
-      handleContextMenu();
+      const rect = e.currentTarget.getBoundingClientRect();
+      handleContextMenu({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
     }
   };
 
@@ -440,6 +441,9 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
           transition: 'transform 0.2s',
         }}
         onKeyDown={handleKeyDown}
+        onPointerEnter={() => {
+          if (appService?.hasContextMenu && !appService.isLinuxApp) void ensureMenu();
+        }}
         {...itemDataAttrs}
         {...handlers}
       >
@@ -455,6 +459,7 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
               handleBookUpload={handleBookUpload}
               handleBookDownload={handleBookDownload}
               showBookDetailsModal={showBookDetailsModal}
+              showTimeRemaining={showTimeRemaining}
             />
           ) : (
             <GroupItem
@@ -466,6 +471,13 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
           )}
         </div>
       </div>
+      {inAppMenuPosition && (
+        <BookContextMenuPopup
+          position={inAppMenuPosition}
+          items={buildMenuItems()}
+          onClose={() => setInAppMenuPosition(null)}
+        />
+      )}
     </div>
   );
 };

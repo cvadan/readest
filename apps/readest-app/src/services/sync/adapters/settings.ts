@@ -28,11 +28,17 @@ export const SETTINGS_REPLICA_ID = 'singleton';
  *     (`customFonts`, `customTextures`, `customDictionaries`,
  *     `opdsCatalogs`). Note: `dictionarySettings` sub-fields
  *     (providerOrder / providerEnabled / webSearches) ARE bundled
- *     here — see entries below.
+ *     here — see entries below. They ride this row for transport but
+ *     are gated by the 'dictionary' sync category, not 'settings'
+ *     (see `SETTINGS_DICTIONARY_FIELDS`).
  */
 export const SETTINGS_WHITELIST = [
   'globalViewSettings.userStylesheet',
   'globalViewSettings.userUIStylesheet',
+  // Library-scope proofread (find/replace) rules. Whole-field LWW like the
+  // other arrays here. Book- and selection-scope rules already ride along the
+  // book config sync; only these global rules were stranded on one device.
+  'globalViewSettings.proofreadRules',
   'globalReadSettings.customThemes',
   'globalReadSettings.customHighlightColors',
   'globalReadSettings.userHighlightColors',
@@ -45,6 +51,7 @@ export const SETTINGS_WHITELIST = [
   'dictionarySettings.providerOrder',
   'dictionarySettings.providerEnabled',
   'dictionarySettings.webSearches',
+  'dictionarySettings.fontScale',
   // External integrations. Server URL + identifiers sync as plaintext;
   // the credential fields are listed in `encryptedFields` below so the
   // publish/pull middleware wraps them in cipher envelopes.
@@ -52,9 +59,62 @@ export const SETTINGS_WHITELIST = [
   'kosync.username',
   'kosync.userkey',
   'kosync.password',
+  'bookorbit.serverUrl',
+  'bookorbit.username',
+  'bookorbit.userkey',
+  'bookorbit.password',
   'readwise.baseUrl',
   'readwise.accessToken',
   'hardcover.accessToken',
+  // WebDAV connection. serverUrl + rootPath sync as plaintext so a fresh
+  // device pre-fills the connect form; username / password are listed in
+  // `encryptedFields` below. Per-device bookkeeping (enabled, deviceId,
+  // lastSyncedAt, sync sub-toggles) is deliberately excluded — see KOSync,
+  // which likewise syncs credentials but not its `enabled` flag.
+  'webdav.serverUrl',
+  'webdav.username',
+  'webdav.password',
+  'webdav.rootPath',
+  // S3-compatible object store. endpoint / region / bucket sync as plaintext so
+  // a fresh device pre-fills the connect form; accessKeyId / secretAccessKey are
+  // listed in `encryptedFields` below. Per-device bookkeeping (enabled,
+  // deviceId, lastSyncedAt, providerSelectedAt, sync sub-toggles) is
+  // deliberately excluded — mirrors WebDAV.
+  's3.endpoint',
+  's3.region',
+  's3.bucket',
+  's3.accessKeyId',
+  's3.secretAccessKey',
+] as const;
+
+/**
+ * Whitelisted paths that belong to the user-facing "Dictionaries" sync
+ * category rather than "App settings". They ride the bundled settings
+ * row because that's where the values live in SystemSettings, but the
+ * user reads the Manage Sync panel by category, not by transport: with
+ * Dictionaries off, provider order / enable flags / web searches must
+ * neither leave nor enter the device (#5465).
+ *
+ * `publishSettingsIfChanged` drops these from the push and
+ * `applyRemoteSettings` strips them from an incoming patch whenever
+ * `isSyncCategoryEnabled('dictionary')` is false.
+ *
+ * The dependency edge in `syncCategories.ts` (dictionary requires
+ * settings) still holds in the other direction: these can only travel
+ * while the settings row itself syncs.
+ *
+ * Re-enable semantics differ slightly from a whole-kind category: the
+ * settings row keeps pulling while Dictionaries is off, so its cursor
+ * advances past the discarded values and re-enabling doesn't backfill
+ * them. The local side does resume immediately — the push snapshot was
+ * never updated for these paths, so the next save publishes the local
+ * values — and any later remote edit lands normally under per-field LWW.
+ */
+export const SETTINGS_DICTIONARY_FIELDS = [
+  'dictionarySettings.providerOrder',
+  'dictionarySettings.providerEnabled',
+  'dictionarySettings.webSearches',
+  'dictionarySettings.fontScale',
 ] as const;
 
 /**
@@ -74,8 +134,15 @@ export const SETTINGS_ENCRYPTED_FIELDS = [
   'kosync.username',
   'kosync.userkey',
   'kosync.password',
+  'bookorbit.username',
+  'bookorbit.userkey',
+  'bookorbit.password',
   'readwise.accessToken',
   'hardcover.accessToken',
+  'webdav.username',
+  'webdav.password',
+  's3.accessKeyId',
+  's3.secretAccessKey',
 ] as const;
 
 export type SettingsWhitelistKey = (typeof SETTINGS_WHITELIST)[number];
